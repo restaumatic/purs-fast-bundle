@@ -1,0 +1,31 @@
+name:                purs-fast-bundle
+version:             0.1.0.0
+homepage:            https://github.com/zyla/purs-fast-bundle#readme
+license:             BSD3
+author:              Maciej Bielecki
+maintainer:          maciej.bielecki@prati.pl
+copyright:           2018 Maciej Bielecki
+category:            Web
+extra-source-files:
+- README.md
+
+dependencies:
+  - base >= 4.7 && < 5
+  - language-javascript
+  - containers
+  - syb
+  - filepath
+  - base-compat
+  - mtl
+  - array
+  - protolude
+  - directory
+  - clock
+  - text
+  - deepseq
+
+executables:
+  purs-fast-bundle:
+    source-dirs:      src
+    main:             Main.hs
+    ghc-options:      -O2
