@@ -25,6 +25,7 @@ dependencies:
   - deepseq
   - bytestring
   - binary
+  - cryptonite
 
 executables:
   purs-fast-bundle:

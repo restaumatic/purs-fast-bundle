@@ -40,7 +40,7 @@
 module Bundle where
 
 import Prelude.Compat
-import Protolude (ordNub, for, exitFailure)
+import Protolude (ordNub, for, exitFailure, encodeUtf8)
 
 import Data.Word
 import Data.List (intersperse)
@@ -76,17 +76,26 @@ import System.FilePath (takeFileName, takeDirectory, takeDirectory, makeRelative
 
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
+import qualified Data.Text.Encoding as T
 import           Data.Text (Text)
 import           System.Clock
 import           Text.Printf
 
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as Builder
 
 import Data.Binary (Binary)
 import qualified Data.Binary as Binary
+
+import Crypto.Hash as H
+
+type SourceHash = Text
+
+hexSha1 :: Text -> SourceHash
+hexSha1 str = T.pack $ show (H.hash (T.encodeUtf8 str :: BS.ByteString) :: H.Digest H.SHA1)
 
 -- | The type of error messages. We separate generation and rendering of errors using a data
 -- type, in case we need to match on error types later.
@@ -175,7 +184,7 @@ data ModuleElement p
 deriving instance Binary (ModuleElement Raw)
 
 -- | A module is just a list of elements of the types listed above.
-data Module p = Module ModuleIdentifier (Maybe FilePath) [ModuleElement p]
+data Module p = Module { module_id :: ModuleIdentifier , module_filename :: Maybe FilePath, module_sourceHash :: SourceHash, module_contents :: [ModuleElement p] }
   deriving (Show, Generic)
 
 deriving instance Binary (Module Raw)
@@ -243,7 +252,7 @@ stripSuffix suffix xs =
 --
 --    where name is the name of a member defined in the current module.
 withDeps :: Module Parsed -> Module Parsed
-withDeps (Module modulePath fn es) = Module modulePath fn (map expandDeps es)
+withDeps mod@Module{module_id=modulePath, module_contents=es} = mod { module_contents = map expandDeps es }
   where
   -- | Collects all modules which are imported, so that we can identify dependencies of the first type.
   imports :: [(String, ModuleIdentifier)]
@@ -332,9 +341,9 @@ trailingCommaList (JSCTLNone l) = commaList l
 --
 -- Each type of module element is matched using pattern guards, and everything else is bundled into the
 -- Other constructor.
-toModule :: forall m. (MonadError ErrorMessage m) => S.Set String -> ModuleIdentifier -> Maybe FilePath -> JSAST -> m (Module Parsed)
-toModule mids mid filename top
-  | JSAstProgram smts _ <- top = Module mid filename <$> traverse toModuleElement smts
+toModule :: forall m. (MonadError ErrorMessage m) => S.Set String -> ModuleIdentifier -> Maybe FilePath -> SourceHash -> JSAST -> m (Module Parsed)
+toModule mids mid filename sourceHash top
+  | JSAstProgram smts _ <- top = Module mid filename sourceHash <$> traverse toModuleElement smts
   | otherwise = err InvalidTopLevel
   where
   err :: forall a. ErrorMessage -> m a
@@ -475,7 +484,7 @@ compile modules entryPoints = filteredModules
   -- | The vertex set
   verts :: [(ModuleElement p, Key, [Key])]
   verts = do
-    Module mid _ els <- modules
+    Module{module_id=mid, module_contents=els} <- modules
     concatMap (toVertices mid) els
     where
     -- | Create a set of vertices for a module element.
@@ -518,7 +527,7 @@ compile modules entryPoints = filteredModules
   filteredModules = map filterUsed modules
     where
     filterUsed :: Module p -> Module p
-    filterUsed (Module mid fn ds) = Module mid fn (map filterExports (go ds))
+    filterUsed mod@Module{module_id=mid, module_contents=ds} = mod { module_contents = map filterExports (go ds) }
       where
       go :: [ModuleElement p] -> [ModuleElement p]
       go [] = []
@@ -557,8 +566,8 @@ sortModules :: [Module p] -> [Module p]
 sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (topSort graph))
   where
   (graph, nodeFor, _) = graphFromEdges $ do
-    m@(Module mid _ els) <- modules
-    return (m, mid, mapMaybe getKey els)
+    m <- modules
+    return (m, module_id m, mapMaybe getKey (module_contents m))
 
   getKey :: ModuleElement p -> Maybe ModuleIdentifier
   getKey (Require _ _ (Right mi)) = Just mi
@@ -570,7 +579,7 @@ sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (top
 --
 -- If a module is empty, we don't want to generate code for it.
 isModuleEmpty :: Module p -> Bool
-isModuleEmpty (Module _ _ els) = all isElementEmpty els
+isModuleEmpty Module{module_contents=els} = all isElementEmpty els
   where
   isElementEmpty :: ModuleElement p -> Bool
   isElementEmpty (ExportsList exps) = null exps
@@ -603,7 +612,7 @@ renderModuleElement = \case
   Skip -> Skip
 
 renderModule :: Module Parsed -> Module Raw
-renderModule (Module mid fp decls) = Module mid fp (map renderModuleElement decls)
+renderModule mod@Module{module_contents=decls} = mod { module_contents = map renderModuleElement decls }
 
 codeGen2 :: Maybe String -- ^ main module
         -> String -- ^ namespace
@@ -617,12 +626,10 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
   
   where
 
-  moduleFns = map (\(Module _ fn _) -> fn) ms
-
   modulesJS = map moduleToJS ms
 
   moduleToJS :: Module Raw -> ByteString
-  moduleToJS (Module mid _ ds) = wrap mid $ mconcat jsDecls
+  moduleToJS mod@Module{module_id=mid,module_contents=ds} = wrap mid $ mconcat jsDecls
     where
     jsDecls = map declToJS ds
 
@@ -739,180 +746,6 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
   lf :: JSAnnot
   lf = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty "\n" ]
 
-
-  lfsp :: JSAnnot
-  lfsp = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty "\n  " ]
-
-  sp :: JSAnnot
-  sp = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty " " ]
-
--- | Generate code for a set of modules, including a call to main().
---
--- Modules get defined on the global PS object, as follows:
---
---     var PS = { };
---     (function(exports) {
---       ...
---     })(PS["Module.Name"] = PS["Module.Name"] || {});
---
--- In particular, a module and its foreign imports share the same namespace inside PS.
--- This saves us from having to generate unique names for a module and its foreign imports,
--- and is safe since a module shares a namespace with its foreign imports in PureScript as well
--- (so there is no way to have overlaps in code generated by the compiler).
-codeGen :: Maybe String -- ^ main module
-        -> String -- ^ namespace
-        -> [Module Parsed] -- ^ input modules
-        -> Maybe String -- ^ output filename
-        -> String
-codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
-  where
-  rendered = renderToString (JSAstProgram (prelude : concatMap fst modulesJS ++ maybe [] runMain optionsMainModule) JSNoAnnot)
-  moduleLength :: [JSStatement] -> Int
-  moduleLength = everything (+) (mkQ 0 countw)
-    where
-      countw :: CommentAnnotation -> Int
-      countw (WhiteSpace _ s) = length (filter (== '\n') s)
-      countw _ = 0
-
-  moduleLengths :: [Int]
-  moduleLengths = map (sum . map (either (const 0) id) . snd) modulesJS
-  moduleFns = map (\(Module _ fn _) -> fn) ms
-
-  modulesJS = map moduleToJS ms
-
-  moduleToJS :: Module Parsed -> ([JSStatement], [Either Int Int])
-  moduleToJS (Module mid _ ds) = (wrap mid (concat jsDecls), lengths)
-    where
-    (jsDecls, lengths) = unzip $ map declToJS ds
-
-    withLength :: [JSStatement] -> ([JSStatement], Either Int Int)
-    withLength n = (n, Right $ moduleLength n)
-
-    declToJS :: ModuleElement Parsed -> ([JSStatement], Either Int Int)
-    declToJS (Member (CodeParsed n) _ _ _ _) = withLength [n]
-    declToJS (Other (CodeParsed n)) = withLength [n]
-    declToJS Skip = ([], Left 0)
-    declToJS (Require _ nm req) = withLength
-      [
-        JSVariable lfsp
-          (cList [
-            JSVarInitExpression (JSIdentifier sp nm)
-              (JSVarInit sp $ either require (innerModuleReference sp . moduleName) req )
-          ]) (JSSemi JSNoAnnot)
-      ]
-    declToJS (ExportsList exps) = withLength $ map toExport exps
-
-      where
-
-      toExport :: (ExportType, String, Code Parsed JSExpression, [Key]) -> JSStatement
-      toExport (_, nm, val, _) =
-        JSAssignStatement
-          (JSMemberSquare (JSIdentifier lfsp "exports") JSNoAnnot
-            (str nm) JSNoAnnot)
-          (JSAssign sp)
-          (unwrapParsed val)
-          (JSSemi JSNoAnnot)
-
-  -- comma lists are reverse-consed
-  cList :: [a] -> JSCommaList a
-  cList [] = JSLNil
-  cList [x] = JSLOne x
-  cList l = go $ reverse l
-    where
-      go [x] = JSLOne x
-      go (h:t)= JSLCons (go t) JSNoAnnot h
-      go [] = error "Invalid case in comma-list"
-
-  prelude :: JSStatement
-  prelude = JSVariable (JSAnnot tokenPosnEmpty [ CommentA tokenPosnEmpty $ "// Generated by purs-fast-bundle"
-                                               , WhiteSpace tokenPosnEmpty "\n" ])
-              (cList [
-                JSVarInitExpression (JSIdentifier sp optionsNamespace)
-                  (JSVarInit sp (emptyObj sp))
-              ]) (JSSemi JSNoAnnot)
-
-  require :: String -> JSExpression
-  require mn =
-    JSMemberExpression (JSIdentifier JSNoAnnot "require") JSNoAnnot (cList [ str mn ]) JSNoAnnot
-
-  moduleReference :: JSAnnot -> String -> JSExpression
-  moduleReference a mn =
-    JSMemberSquare (JSIdentifier a optionsNamespace) JSNoAnnot
-      (str mn) JSNoAnnot
-
-  innerModuleReference :: JSAnnot -> String -> JSExpression
-  innerModuleReference a mn =
-    JSMemberSquare (JSIdentifier a "$PS") JSNoAnnot
-      (str mn) JSNoAnnot
-
-
-  str :: String -> JSExpression
-  str s = JSStringLiteral JSNoAnnot $ "\"" ++ s ++ "\""
-
-
-  emptyObj :: JSAnnot -> JSExpression
-  emptyObj a = JSObjectLiteral a (JSCTLNone JSLNil) JSNoAnnot
-
-  initializeObject :: JSAnnot -> (JSAnnot -> String -> JSExpression) -> String -> JSExpression
-  initializeObject a makeReference mn =
-    JSAssignExpression (makeReference a mn) (JSAssign sp)
-    $ JSExpressionBinary (makeReference sp mn) (JSBinOpOr sp)
-    $ emptyObj sp
-
-  -- Like `somewhere`, but stops after the first successful transformation
-  firstwhere :: MonadPlus m => GenericM m -> GenericM m
-  firstwhere f x = f x `mplus` gmapMo (firstwhere f) x
-
-  prependWhitespace :: String -> [JSStatement] -> [JSStatement]
-  prependWhitespace val = fromMaybe <*> firstwhere (mkMp $ Just . reannotate)
-    where
-    reannotate (JSAnnot rpos annots) = JSAnnot rpos (ws : annots)
-    reannotate _ = JSAnnot tokenPosnEmpty [ws]
-
-    ws = WhiteSpace tokenPosnEmpty val
-
-  iife :: [JSStatement] -> String -> JSExpression -> JSStatement
-  iife body param arg =
-    JSMethodCall (JSExpressionParen lf (JSFunctionExpression JSNoAnnot JSIdentNone JSNoAnnot (JSLOne (JSIdentName JSNoAnnot param)) JSNoAnnot
-                                                             (JSBlock sp (prependWhitespace "\n  " body) lf))
-                                    JSNoAnnot)
-                 JSNoAnnot
-                 (JSLOne arg)
-                 JSNoAnnot
-                 (JSSemi JSNoAnnot)
-
-  wrap :: ModuleIdentifier -> [JSStatement] -> [JSStatement]
-  wrap (ModuleIdentifier mn mtype) ds =
-    case mtype of
-      Regular -> [iife (addModuleExports ds) "$PS" (JSIdentifier JSNoAnnot optionsNamespace)]
-      Foreign -> [iife ds "exports" (initializeObject JSNoAnnot moduleReference mn)]
-    where
-      -- Insert the exports var after a directive prologue, if one is present.
-      -- Per ECMA-262 5.1, "A Directive Prologue is the longest sequence of
-      -- ExpressionStatement productions [...] where each ExpressionStatement
-      -- [...] consists entirely of a StringLiteral [...]."
-      -- (http://ecma-international.org/ecma-262/5.1/#sec-14.1)
-      addModuleExports :: [JSStatement] -> [JSStatement]
-      addModuleExports (x:xs) | isDirective x = x : addModuleExports xs
-      addModuleExports xs
-        = JSExpressionStatement (initializeObject lfsp innerModuleReference mn) (JSSemi JSNoAnnot)
-        : JSVariable lfsp (JSLOne $ JSVarInitExpression (JSIdentifier sp "exports") $ JSVarInit sp (innerModuleReference sp mn)) (JSSemi JSNoAnnot)
-        : xs
-
-      isDirective (JSExpressionStatement (JSStringLiteral _ _) _) = True
-      isDirective _ = False
-
-  runMain :: String -> [JSStatement]
-  runMain mn =
-    [JSMethodCall
-      (JSMemberDot (moduleReference lf mn) JSNoAnnot
-        (JSIdentifier JSNoAnnot "main"))
-      JSNoAnnot (cList []) JSNoAnnot (JSSemi JSNoAnnot)]
-
-  lf :: JSAnnot
-  lf = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty "\n" ]
-
-
   lfsp :: JSAnnot
   lfsp = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty "\n  " ]
 
@@ -953,24 +786,25 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
 
 loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set String -> (ModuleIdentifier, FilePath) -> m (Module Raw)
 loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
-  -- TODO: check if source file changed (via timestamp or hash)
   exists <- liftIO $ doesFileExist cacheFilename
+  js <- liftIO $ readFile filename
+  let sourceHash = hexSha1 (T.pack js)
   if exists then
     liftIO (Binary.decodeFileOrFail cacheFilename) >>= \case
-      Left err ->
-        parseModuleAndWriteCache
-      Right x ->
-        pure x
+      Right mod | module_sourceHash mod == sourceHash ->
+        pure mod
+      _ ->
+        parseModuleAndWriteCache js sourceHash
   else
-    parseModuleAndWriteCache
+    parseModuleAndWriteCache js sourceHash
 
   where
   cacheFilename = ".purs-fast-bundle-cache/" <> modName <> (if moduleType == Regular then "" else "_foreign")
 
-  parseModuleAndWriteCache = do
-    js <- liftIO $ readFile filename
+  parseModuleAndWriteCache js sourceHash = do
+    liftIO $ hPutStrLn stderr $ "Parsing " <> filename
     ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse js (moduleName ident)
-    module_ <- toModule mids ident (Just filename) ast
+    module_ <- toModule mids ident (Just filename) sourceHash ast
     let rawModule = renderModule $ withDeps module_
     liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
     liftIO $ Binary.encodeFile cacheFilename rawModule
