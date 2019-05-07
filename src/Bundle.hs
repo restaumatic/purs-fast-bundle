@@ -537,14 +537,14 @@ compile modules entryPoints = filteredModules
 
 -- | Topologically sort the module dependency graph, so that when we generate code, modules can be
 -- defined in the right order.
-sortModules :: [Module Parsed] -> [Module Parsed]
+sortModules :: [Module p] -> [Module p]
 sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (topSort graph))
   where
   (graph, nodeFor, _) = graphFromEdges $ do
     m@(Module mid _ els) <- modules
     return (m, mid, mapMaybe getKey els)
 
-  getKey :: ModuleElement Parsed -> Maybe ModuleIdentifier
+  getKey :: ModuleElement p -> Maybe ModuleIdentifier
   getKey (Require _ _ (Right mi)) = Just mi
   getKey _ = Nothing
 
@@ -553,10 +553,10 @@ sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (top
 -- "other" foreign code).
 --
 -- If a module is empty, we don't want to generate code for it.
-isModuleEmpty :: Module Parsed -> Bool
+isModuleEmpty :: Module p -> Bool
 isModuleEmpty (Module _ _ els) = all isElementEmpty els
   where
-  isElementEmpty :: ModuleElement Parsed -> Bool
+  isElementEmpty :: ModuleElement p -> Bool
   isElementEmpty (ExportsList exps) = null exps
   isElementEmpty Require{} = True
   isElementEmpty (Other _) = True
@@ -929,11 +929,11 @@ bundleSM inputStrs entryPoints mainModule namespace outFilename = do
 
   let compiled = compile modules entryPoints
   logPerf "compile" $ liftIO $ evaluate $ length compiled
-  sorted <- logPerf "sortModules" $ liftIO $ evaluate $ sortModules (filter (not . isModuleEmpty) compiled)
+  let compiled' = map renderModule compiled
+  sorted <- logPerf "sortModules" $ liftIO $ evaluate $ sortModules (filter (not . isModuleEmpty) compiled')
 
   logPerf "codegen" $ do
-    let sorted' = map renderModule sorted
-    let code = codeGen2 mainModule namespace sorted' outFilename
+    let code = codeGen2 mainModule namespace sorted outFilename
     liftIO $ evaluate $ BL.length code
     pure code
 
