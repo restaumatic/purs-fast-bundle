@@ -787,8 +787,8 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
 loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set String -> (ModuleIdentifier, FilePath) -> m (Module Raw)
 loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
   exists <- liftIO $ doesFileExist cacheFilename
-  js <- liftIO $ readFile filename
-  let sourceHash = hexSha1 (T.pack js)
+  js <- liftIO $ T.readFile filename
+  let sourceHash = hexSha1 js
   if exists then
     liftIO (Binary.decodeFileOrFail cacheFilename) >>= \case
       Right mod | module_sourceHash mod == sourceHash ->
@@ -803,7 +803,7 @@ loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
 
   parseModuleAndWriteCache js sourceHash = do
     liftIO $ hPutStrLn stderr $ "Parsing " <> filename
-    ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse js (moduleName ident)
+    ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse (T.unpack js) (moduleName ident)
     module_ <- toModule mids ident (Just filename) sourceHash ast
     let rawModule = renderModule $ withDeps module_
     liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
