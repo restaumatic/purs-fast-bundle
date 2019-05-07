@@ -157,7 +157,7 @@ data ModuleElement p
   | Member (Code p JSStatement) Bool String (Code p JSExpression) [Key]
   | ExportsList [(ExportType, String, Code p JSExpression, [Key])]
   | Other (Code p JSStatement)
-  | Skip (Code p JSStatement)
+  | Skip
   deriving (Show)
 
 -- | A module is just a list of elements of the types listed above.
@@ -450,14 +450,14 @@ extractLabel (JSPropertyIdent _ nm) = Just nm
 extractLabel _ = Nothing
 
 -- | Eliminate unused code based on the specified entry point set.
-compile :: [Module Parsed] -> [ModuleIdentifier] -> [Module Parsed]
+compile :: forall p. [Module p] -> [ModuleIdentifier] -> [Module p]
 compile modules [] = modules
 compile modules entryPoints = filteredModules
   where
   (graph, vertexToNode, vertexFor) = graphFromEdges verts
 
   -- | The vertex set
-  verts :: [(ModuleElement Parsed, Key, [Key])]
+  verts :: [(ModuleElement p, Key, [Key])]
   verts = do
     Module mid _ els <- modules
     concatMap (toVertices mid) els
@@ -471,7 +471,7 @@ compile modules entryPoints = filteredModules
     --
     -- 2) Require statements don't contribute towards dependencies, since they effectively get
     --    inlined wherever they are used inside other module elements.
-    toVertices :: ModuleIdentifier -> ModuleElement Parsed -> [(ModuleElement Parsed, Key, [Key])]
+    toVertices :: ModuleIdentifier -> ModuleElement p -> [(ModuleElement p, Key, [Key])]
     toVertices p m@(Member _ _ nm _ deps) = [(m, (p, nm), deps)]
     toVertices p m@(ExportsList exps) = mapMaybe toVertex exps
       where
@@ -498,31 +498,31 @@ compile modules entryPoints = filteredModules
     vertToModuleRefs v = foldMap (S.singleton . vertToModule) $ graph ! v
     vertToModule v = m where (_, (m, _), _) = vertexToNode v
 
-  filteredModules :: [Module Parsed]
+  filteredModules :: [Module p]
   filteredModules = map filterUsed modules
     where
-    filterUsed :: Module Parsed -> Module Parsed
+    filterUsed :: Module p -> Module p
     filterUsed (Module mid fn ds) = Module mid fn (map filterExports (go ds))
       where
-      go :: [ModuleElement Parsed] -> [ModuleElement Parsed]
+      go :: [ModuleElement p] -> [ModuleElement p]
       go [] = []
       go (d : rest)
         | not (isDeclUsed d) = skipDecl d : go rest
         | otherwise = d : go rest
 
-      skipDecl :: ModuleElement Parsed -> ModuleElement Parsed
-      skipDecl (Require s _ _) = Skip s
-      skipDecl (Member s _ _ _ _) = Skip s
-      skipDecl (ExportsList _) = Skip (CodeParsed (JSEmptyStatement JSNoAnnot))
-      skipDecl (Other s) = Skip s
-      skipDecl (Skip s) = Skip s
+      skipDecl :: ModuleElement p -> ModuleElement p
+      skipDecl (Require s _ _) = Skip
+      skipDecl (Member s _ _ _ _) = Skip
+      skipDecl (ExportsList _) = Skip
+      skipDecl (Other s) = Skip
+      skipDecl Skip = Skip
 
       -- | Filter out the exports for members which aren't used.
-      filterExports :: ModuleElement Parsed -> ModuleElement Parsed
+      filterExports :: ModuleElement p -> ModuleElement p
       filterExports (ExportsList exps) = ExportsList (filter (\(_, nm, _, _) -> isKeyUsed (mid, nm)) exps)
       filterExports me = me
 
-      isDeclUsed :: ModuleElement Parsed -> Bool
+      isDeclUsed :: ModuleElement p -> Bool
       isDeclUsed (Member _ _ nm _ _) = isKeyUsed (mid, nm)
       isDeclUsed (Require _ _ (Right midRef)) = midRef `S.member` modulesReferenced
       isDeclUsed _ = True
@@ -559,8 +559,8 @@ isModuleEmpty (Module _ _ els) = all isElementEmpty els
   isElementEmpty :: ModuleElement p -> Bool
   isElementEmpty (ExportsList exps) = null exps
   isElementEmpty Require{} = True
-  isElementEmpty (Other _) = True
-  isElementEmpty (Skip _) = True
+  isElementEmpty Other{} = True
+  isElementEmpty Skip{} = True
   isElementEmpty _ = False
 
 ppStatement' :: JS.JSStatement -> ByteString
@@ -584,7 +584,7 @@ renderModuleElement = \case
   Member stmt f nm decl deps -> Member (ppStatement stmt) f nm (ppExpression decl) deps
   ExportsList exps -> ExportsList (map (\(type_, s, expr, deps) -> (type_, s, ppExpression expr, deps)) exps)
   Other stmt -> Other (ppStatement stmt)
-  Skip stmt -> Skip (ppStatement stmt)
+  Skip -> Skip
 
 renderModule :: Module Parsed -> Module Raw
 renderModule (Module mid fp decls) = Module mid fp (map renderModuleElement decls)
@@ -613,7 +613,7 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
     declToJS :: ModuleElement Raw -> ByteString
     declToJS (Member (CodeRaw n) _ _ _ _) = n
     declToJS (Other (CodeRaw n)) = n
-    declToJS (Skip (CodeRaw n)) = ""
+    declToJS Skip = ""
     declToJS (Require _ nm req) =
       ppStatement' $
         JSVariable lfsp
@@ -775,7 +775,7 @@ codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
     declToJS :: ModuleElement Parsed -> ([JSStatement], Either Int Int)
     declToJS (Member (CodeParsed n) _ _ _ _) = withLength [n]
     declToJS (Other (CodeParsed n)) = withLength [n]
-    declToJS (Skip (CodeParsed n)) = ([], Left $ moduleLength [n])
+    declToJS Skip = ([], Left 0)
     declToJS (Require _ nm req) = withLength
       [
         JSVariable lfsp
@@ -925,12 +925,12 @@ bundleSM inputStrs entryPoints mainModule namespace outFilename = do
 
   let mids = S.fromList (map (moduleName . mid) input)
 
-  modules <- traverse (fmap withDeps . (\(a,fn,c) -> toModule mids a fn c)) input
+  parsedModules <- traverse (fmap withDeps . (\(a,fn,c) -> toModule mids a fn c)) input
+  let modules = map renderModule parsedModules
 
   let compiled = compile modules entryPoints
   logPerf "compile" $ liftIO $ evaluate $ length compiled
-  let compiled' = map renderModule compiled
-  sorted <- logPerf "sortModules" $ liftIO $ evaluate $ sortModules (filter (not . isModuleEmpty) compiled')
+  sorted <- logPerf "sortModules" $ liftIO $ evaluate $ sortModules (filter (not . isModuleEmpty) compiled)
 
   logPerf "codegen" $ do
     let code = codeGen2 mainModule namespace sorted outFilename
