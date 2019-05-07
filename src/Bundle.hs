@@ -4,6 +4,9 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 -- |
 -- Bundles compiled PureScript modules for the browser.
@@ -68,6 +71,8 @@ import           Data.Text (Text)
 import           System.Clock
 import           Text.Printf
 
+import Data.ByteString.Lazy (ByteString)
+
 -- | The type of error messages. We separate generation and rendering of errors using a data
 -- type, in case we need to match on error types later.
 data ErrorMessage
@@ -118,6 +123,19 @@ data ExportType
   | ForeignReexport
   deriving (Show, Eq, Ord)
 
+data Phase = Raw | Parsed
+
+data Code phase a where
+  CodeRaw :: ByteString -> Code Raw a
+  CodeParsed :: a -> Code Parsed a
+
+instance Show a => Show (Code phase a) where
+  show (CodeRaw x) = show x
+  show (CodeParsed x) = show x
+
+unwrapParsed :: Code Parsed a -> a
+unwrapParsed (CodeParsed x) = x
+
 -- | There are four types of module element we are interested in:
 --
 -- 1) Require statements
@@ -127,16 +145,17 @@ data ExportType
 --
 -- Each is labelled with the original AST node which generated it, so that we can dump it back
 -- into the output during codegen.
-data ModuleElement
-  = Require JSStatement String (Either String ModuleIdentifier)
-  | Member JSStatement Bool String JSExpression [Key]
-  | ExportsList [(ExportType, String, JSExpression, [Key])]
-  | Other JSStatement
-  | Skip JSStatement
+data ModuleElement p
+  = Require (Code p JSStatement) String (Either String ModuleIdentifier)
+  | Member (Code p JSStatement) Bool String (Code p JSExpression) [Key]
+  | ExportsList [(ExportType, String, Code p JSExpression, [Key])]
+  | Other (Code p JSStatement)
+  | Skip (Code p JSStatement)
   deriving (Show)
 
 -- | A module is just a list of elements of the types listed above.
-data Module = Module ModuleIdentifier (Maybe FilePath) [ModuleElement] deriving (Show)
+data Module p = Module ModuleIdentifier (Maybe FilePath) [ModuleElement p]
+  deriving (Show)
 
 -- | Prepare an error message for consumption by humans.
 printErrorMessage :: ErrorMessage -> [String]
@@ -200,14 +219,14 @@ stripSuffix suffix xs =
 -- 2) name
 --
 --    where name is the name of a member defined in the current module.
-withDeps :: Module -> Module
+withDeps :: Module Parsed -> Module Parsed
 withDeps (Module modulePath fn es) = Module modulePath fn (map expandDeps es)
   where
   -- | Collects all modules which are imported, so that we can identify dependencies of the first type.
   imports :: [(String, ModuleIdentifier)]
   imports = mapMaybe toImport es
     where
-    toImport :: ModuleElement -> Maybe (String, ModuleIdentifier)
+    toImport :: ModuleElement Parsed -> Maybe (String, ModuleIdentifier)
     toImport (Require _ nm (Right mid)) = Just (nm, mid)
     toImport _ = Nothing
 
@@ -215,16 +234,16 @@ withDeps (Module modulePath fn es) = Module modulePath fn (map expandDeps es)
   boundNames :: [String]
   boundNames = mapMaybe toBoundName es
     where
-    toBoundName :: ModuleElement -> Maybe String
+    toBoundName :: ModuleElement Parsed -> Maybe String
     toBoundName (Member _ _ nm _ _) = Just nm
     toBoundName _ = Nothing
 
   -- | Calculate dependencies and add them to the current element.
-  expandDeps :: ModuleElement -> ModuleElement
-  expandDeps (Member n f nm decl _) = Member n f nm decl (S.toList $ dependencies modulePath decl)
+  expandDeps :: ModuleElement Parsed -> ModuleElement Parsed
+  expandDeps (Member n f nm decl _) = Member n f nm decl (S.toList $ dependencies modulePath $ unwrapParsed decl)
   expandDeps (ExportsList exps) = ExportsList (map expand exps)
       where
-      expand (ty, nm, n1, _) = (ty, nm, n1, S.toList (dependencies modulePath n1))
+      expand (ty, nm, n1, _) = (ty, nm, n1, S.toList (dependencies modulePath $ unwrapParsed n1))
   expandDeps other = other
 
   dependencies :: ModuleIdentifier -> JSExpression -> S.Set (ModuleIdentifier, String)
@@ -290,27 +309,28 @@ trailingCommaList (JSCTLNone l) = commaList l
 --
 -- Each type of module element is matched using pattern guards, and everything else is bundled into the
 -- Other constructor.
-toModule :: forall m. (MonadError ErrorMessage m) => S.Set String -> ModuleIdentifier -> Maybe FilePath -> JSAST -> m Module
+toModule :: forall m. (MonadError ErrorMessage m) => S.Set String -> ModuleIdentifier -> Maybe FilePath -> JSAST -> m (Module Parsed)
 toModule mids mid filename top
   | JSAstProgram smts _ <- top = Module mid filename <$> traverse toModuleElement smts
   | otherwise = err InvalidTopLevel
   where
+  err :: forall a. ErrorMessage -> m a
   err = throwError . ErrorInModule mid
 
-  toModuleElement :: JSStatement -> m ModuleElement
+  toModuleElement :: JSStatement -> m (ModuleElement Parsed)
   toModuleElement stmt
     | Just (importName, importPath) <- matchRequire mids mid stmt
-    = pure (Require stmt importName importPath)
+    = pure (Require (CodeParsed stmt) importName importPath)
   toModuleElement stmt
     | Just (exported, name, decl) <- matchMember stmt
-    = pure (Member stmt exported name decl [])
+    = pure (Member (CodeParsed stmt) exported name (CodeParsed decl) [])
   toModuleElement stmt
     | Just props <- matchExportsAssignment stmt
     = ExportsList <$> traverse toExport (trailingCommaList props)
     where
-      toExport :: JSObjectProperty -> m (ExportType, String, JSExpression, [Key])
+      toExport :: JSObjectProperty -> m (ExportType, String, Code Parsed JSExpression, [Key])
       toExport (JSPropertyNameandValue name _ [val]) =
-        (,,val,[]) <$> exportType val
+        (,,CodeParsed val,[]) <$> exportType val
                    <*> extractLabel' name
       toExport _ = err UnsupportedExport
 
@@ -326,13 +346,13 @@ toModule mids mid filename top
 
       extractLabel' = maybe (err UnsupportedExport) pure . extractLabel
 
-  toModuleElement other = pure (Other other)
+  toModuleElement other = pure (Other (CodeParsed other))
 
 -- Get a list of all the exported identifiers from a foreign module.
 --
 -- TODO: what if we assign to exports.foo and then later assign to
 -- module.exports (presumably overwriting exports.foo)?
-getExportedIdentifiers :: (MonadError ErrorMessage m)
+getExportedIdentifiers :: forall m. (MonadError ErrorMessage m)
                           => String
                           -> JSAST
                           -> m [String]
@@ -340,6 +360,7 @@ getExportedIdentifiers mname top
   | JSAstProgram stmts _ <- top = concat <$> traverse go stmts
   | otherwise = err InvalidTopLevel
   where
+  err :: forall a. ErrorMessage -> m a
   err = throwError . ErrorInModule (ModuleIdentifier mname Foreign)
 
   go stmt
@@ -422,14 +443,14 @@ extractLabel (JSPropertyIdent _ nm) = Just nm
 extractLabel _ = Nothing
 
 -- | Eliminate unused code based on the specified entry point set.
-compile :: [Module] -> [ModuleIdentifier] -> [Module]
+compile :: [Module Parsed] -> [ModuleIdentifier] -> [Module Parsed]
 compile modules [] = modules
 compile modules entryPoints = filteredModules
   where
   (graph, vertexToNode, vertexFor) = graphFromEdges verts
 
   -- | The vertex set
-  verts :: [(ModuleElement, Key, [Key])]
+  verts :: [(ModuleElement Parsed, Key, [Key])]
   verts = do
     Module mid _ els <- modules
     concatMap (toVertices mid) els
@@ -443,7 +464,7 @@ compile modules entryPoints = filteredModules
     --
     -- 2) Require statements don't contribute towards dependencies, since they effectively get
     --    inlined wherever they are used inside other module elements.
-    toVertices :: ModuleIdentifier -> ModuleElement -> [(ModuleElement, Key, [Key])]
+    toVertices :: ModuleIdentifier -> ModuleElement Parsed -> [(ModuleElement Parsed, Key, [Key])]
     toVertices p m@(Member _ _ nm _ deps) = [(m, (p, nm), deps)]
     toVertices p m@(ExportsList exps) = mapMaybe toVertex exps
       where
@@ -470,31 +491,31 @@ compile modules entryPoints = filteredModules
     vertToModuleRefs v = foldMap (S.singleton . vertToModule) $ graph ! v
     vertToModule v = m where (_, (m, _), _) = vertexToNode v
 
-  filteredModules :: [Module]
+  filteredModules :: [Module Parsed]
   filteredModules = map filterUsed modules
     where
-    filterUsed :: Module -> Module
+    filterUsed :: Module Parsed -> Module Parsed
     filterUsed (Module mid fn ds) = Module mid fn (map filterExports (go ds))
       where
-      go :: [ModuleElement] -> [ModuleElement]
+      go :: [ModuleElement Parsed] -> [ModuleElement Parsed]
       go [] = []
       go (d : rest)
         | not (isDeclUsed d) = skipDecl d : go rest
         | otherwise = d : go rest
 
-      skipDecl :: ModuleElement -> ModuleElement
+      skipDecl :: ModuleElement Parsed -> ModuleElement Parsed
       skipDecl (Require s _ _) = Skip s
       skipDecl (Member s _ _ _ _) = Skip s
-      skipDecl (ExportsList _) = Skip (JSEmptyStatement JSNoAnnot)
+      skipDecl (ExportsList _) = Skip (CodeParsed (JSEmptyStatement JSNoAnnot))
       skipDecl (Other s) = Skip s
       skipDecl (Skip s) = Skip s
 
       -- | Filter out the exports for members which aren't used.
-      filterExports :: ModuleElement -> ModuleElement
+      filterExports :: ModuleElement Parsed -> ModuleElement Parsed
       filterExports (ExportsList exps) = ExportsList (filter (\(_, nm, _, _) -> isKeyUsed (mid, nm)) exps)
       filterExports me = me
 
-      isDeclUsed :: ModuleElement -> Bool
+      isDeclUsed :: ModuleElement Parsed -> Bool
       isDeclUsed (Member _ _ nm _ _) = isKeyUsed (mid, nm)
       isDeclUsed (Require _ _ (Right midRef)) = midRef `S.member` modulesReferenced
       isDeclUsed _ = True
@@ -509,14 +530,14 @@ compile modules entryPoints = filteredModules
 
 -- | Topologically sort the module dependency graph, so that when we generate code, modules can be
 -- defined in the right order.
-sortModules :: [Module] -> [Module]
+sortModules :: [Module Parsed] -> [Module Parsed]
 sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (topSort graph))
   where
   (graph, nodeFor, _) = graphFromEdges $ do
     m@(Module mid _ els) <- modules
     return (m, mid, mapMaybe getKey els)
 
-  getKey :: ModuleElement -> Maybe ModuleIdentifier
+  getKey :: ModuleElement Parsed -> Maybe ModuleIdentifier
   getKey (Require _ _ (Right mi)) = Just mi
   getKey _ = Nothing
 
@@ -525,10 +546,10 @@ sortModules modules = map (\v -> case nodeFor v of (n, _, _) -> n) (reverse (top
 -- "other" foreign code).
 --
 -- If a module is empty, we don't want to generate code for it.
-isModuleEmpty :: Module -> Bool
+isModuleEmpty :: Module Parsed -> Bool
 isModuleEmpty (Module _ _ els) = all isElementEmpty els
   where
-  isElementEmpty :: ModuleElement -> Bool
+  isElementEmpty :: ModuleElement Parsed -> Bool
   isElementEmpty (ExportsList exps) = null exps
   isElementEmpty Require{} = True
   isElementEmpty (Other _) = True
@@ -550,7 +571,7 @@ isModuleEmpty (Module _ _ els) = all isElementEmpty els
 -- (so there is no way to have overlaps in code generated by the compiler).
 codeGen :: Maybe String -- ^ main module
         -> String -- ^ namespace
-        -> [Module] -- ^ input modules
+        -> [Module Parsed] -- ^ input modules
         -> Maybe String -- ^ output filename
         -> String
 codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
@@ -569,7 +590,7 @@ codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
 
   modulesJS = map moduleToJS ms
 
-  moduleToJS :: Module -> ([JSStatement], [Either Int Int])
+  moduleToJS :: Module Parsed -> ([JSStatement], [Either Int Int])
   moduleToJS (Module mid _ ds) = (wrap mid (concat jsDecls), lengths)
     where
     (jsDecls, lengths) = unzip $ map declToJS ds
@@ -577,10 +598,10 @@ codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
     withLength :: [JSStatement] -> ([JSStatement], Either Int Int)
     withLength n = (n, Right $ moduleLength n)
 
-    declToJS :: ModuleElement -> ([JSStatement], Either Int Int)
-    declToJS (Member n _ _ _ _) = withLength [n]
-    declToJS (Other n) = withLength [n]
-    declToJS (Skip n) = ([], Left $ moduleLength [n])
+    declToJS :: ModuleElement Parsed -> ([JSStatement], Either Int Int)
+    declToJS (Member (CodeParsed n) _ _ _ _) = withLength [n]
+    declToJS (Other (CodeParsed n)) = withLength [n]
+    declToJS (Skip (CodeParsed n)) = ([], Left $ moduleLength [n])
     declToJS (Require _ nm req) = withLength
       [
         JSVariable lfsp
@@ -593,13 +614,13 @@ codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
 
       where
 
-      toExport :: (ExportType, String, JSExpression, [Key]) -> JSStatement
+      toExport :: (ExportType, String, Code Parsed JSExpression, [Key]) -> JSStatement
       toExport (_, nm, val, _) =
         JSAssignStatement
           (JSMemberSquare (JSIdentifier lfsp "exports") JSNoAnnot
             (str nm) JSNoAnnot)
           (JSAssign sp)
-          val
+          (unwrapParsed val)
           (JSSemi JSNoAnnot)
 
   -- comma lists are reverse-consed

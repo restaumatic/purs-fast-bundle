@@ -23,6 +23,7 @@ dependencies:
   - clock
   - text
   - deepseq
+  - bytestring
 
 executables:
   purs-fast-bundle:
