@@ -7,6 +7,10 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 -- |
 -- Bundles compiled PureScript modules for the browser.
@@ -50,6 +54,7 @@ import System.Environment
 import Control.Exception (evaluate)
 import System.IO
 import Control.DeepSeq
+import GHC.Generics (Generic)
 
 import Data.Array ((!))
 import Data.Char (chr, digitToInt)
@@ -80,6 +85,9 @@ import qualified Data.ByteString.Lazy as BL
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as Builder
 
+import Data.Binary (Binary)
+import qualified Data.Binary as Binary
+
 -- | The type of error messages. We separate generation and rendering of errors using a data
 -- type, in case we need to match on error types later.
 data ErrorMessage
@@ -97,14 +105,14 @@ data ErrorMessage
 data ModuleType
   = Regular
   | Foreign
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Generic, Binary)
 
 showModuleType :: ModuleType -> String
 showModuleType Regular = "Regular"
 showModuleType Foreign = "Foreign"
 
 -- | A module is identified by its module name and its type.
-data ModuleIdentifier = ModuleIdentifier String ModuleType deriving (Show, Eq, Ord)
+data ModuleIdentifier = ModuleIdentifier String ModuleType deriving (Show, Eq, Ord, Generic, Binary)
 
 moduleName :: ModuleIdentifier -> String
 moduleName (ModuleIdentifier name _) = name
@@ -128,7 +136,7 @@ type Key = (ModuleIdentifier, String)
 data ExportType
   = RegularExport String
   | ForeignReexport
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Generic, Binary)
 
 data Phase = Raw | Parsed
 
@@ -139,6 +147,10 @@ data Code phase a where
 instance Show a => Show (Code phase a) where
   show (CodeRaw x) = show x
   show (CodeParsed x) = show x
+
+instance Binary (Code Raw a) where
+  put (CodeRaw x) = Binary.put x
+  get = CodeRaw <$> Binary.get
 
 unwrapParsed :: Code Parsed a -> a
 unwrapParsed (CodeParsed x) = x
@@ -158,11 +170,15 @@ data ModuleElement p
   | ExportsList [(ExportType, String, Code p JSExpression, [Key])]
   | Other (Code p JSStatement)
   | Skip
-  deriving (Show)
+  deriving (Show, Generic)
+
+deriving instance Binary (ModuleElement Raw)
 
 -- | A module is just a list of elements of the types listed above.
 data Module p = Module ModuleIdentifier (Maybe FilePath) [ModuleElement p]
-  deriving (Show)
+  deriving (Show, Generic)
+
+deriving instance Binary (Module Raw)
 
 -- | Prepare an error message for consumption by humans.
 printErrorMessage :: ErrorMessage -> [String]
@@ -907,26 +923,24 @@ codeGen optionsMainModule optionsNamespace ms outFileOpt = rendered
 -- This function performs dead code elimination, filters empty modules
 -- and generates and prints the final JavaScript bundle.
 bundleSM :: (MonadError ErrorMessage m, MonadIO m)
-       => [(ModuleIdentifier, Maybe FilePath, String)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
+       => [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
        -> [ModuleIdentifier] -- ^ Entry points.  These module identifiers are used as the roots for dead-code elimination
        -> Maybe String -- ^ An optional main module.
        -> String -- ^ The namespace (e.g. PS).
        -> Maybe FilePath -- ^ The output file name (if there is one - in which case generate source map)
        -> m ByteString
-bundleSM inputStrs entryPoints mainModule namespace outFilename = do
+bundleSM inputFiles entryPoints mainModule namespace outFilename = do
   let mid (a,_,_) = a
+
+  {- TODO: validations
   forM_ mainModule $ \mname ->
     when (mname `notElem` map (moduleName . mid) inputStrs) (throwError (MissingMainModule mname))
   forM_ entryPoints $ \mIdent ->
     when (mIdent `notElem` map mid inputStrs) (throwError (MissingEntryPoint (moduleName mIdent)))
-  input <- logPerf "parse JS" $ forM inputStrs $ \(ident, filename, js) -> do
-                ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse js (moduleName ident)
-                return (ident, filename, ast)
+  -}
 
-  let mids = S.fromList (map (moduleName . mid) input)
-
-  parsedModules <- traverse (fmap withDeps . (\(a,fn,c) -> toModule mids a fn c)) input
-  let modules = map renderModule parsedModules
+  let mids = S.fromList (map (moduleName . fst) inputFiles)
+  modules <- logPerf "load modules" $ traverse (loadModule mids) inputFiles
 
   let compiled = compile modules entryPoints
   logPerf "compile" $ liftIO $ evaluate $ length compiled
@@ -936,6 +950,31 @@ bundleSM inputStrs entryPoints mainModule namespace outFilename = do
     let code = codeGen2 mainModule namespace sorted outFilename
     liftIO $ evaluate $ BL.length code
     pure code
+
+loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set String -> (ModuleIdentifier, FilePath) -> m (Module Raw)
+loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
+  -- TODO: check if source file changed (via timestamp or hash)
+  exists <- liftIO $ doesFileExist cacheFilename
+  if exists then
+    liftIO (Binary.decodeFileOrFail cacheFilename) >>= \case
+      Left err ->
+        parseModuleAndWriteCache
+      Right x ->
+        pure x
+  else
+    parseModuleAndWriteCache
+
+  where
+  cacheFilename = ".purs-fast-bundle-cache/" <> modName <> (if moduleType == Regular then "" else "_foreign")
+
+  parseModuleAndWriteCache = do
+    js <- liftIO $ readFile filename
+    ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse js (moduleName ident)
+    module_ <- toModule mids ident (Just filename) ast
+    let rawModule = renderModule $ withDeps module_
+    liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
+    liftIO $ Binary.encodeFile cacheFilename rawModule
+    pure rawModule
 
 main :: IO ()
 main = do
@@ -947,10 +986,9 @@ main = do
 
   result <- runExceptT $ do
     
-    input <- logPerf "load files" $ for inputFiles $ \filename -> do
-      js <- liftIO (readFile filename)
+    input <- for inputFiles $ \filename -> do
       mid <- guessModuleIdentifier filename
-      length js `seq` return (mid, Just filename, js)                                            -- evaluate readFile till EOF before returning, not to exhaust file handles
+      return (mid, filename)
 
     let entryIds = map (`ModuleIdentifier` Regular) optionsEntryPoints
 

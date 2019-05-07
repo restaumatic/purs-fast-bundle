@@ -1,2 +1,3 @@
 .stack-work/
 *.cabal
+.purs-fast-bundle-cache/
