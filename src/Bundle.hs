@@ -11,6 +11,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# OPTIONS_GHC -Wunused-top-binds #-}
 
 -- |
 -- Bundles compiled PureScript modules for the browser.
@@ -37,7 +38,7 @@
 --
 -- THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -- ```
-module Bundle where
+module Bundle (main) where
 
 import Prelude.Compat
 import Protolude (ordNub, for, exitFailure, encodeUtf8)
@@ -120,15 +121,17 @@ showModuleType :: ModuleType -> String
 showModuleType Regular = "Regular"
 showModuleType Foreign = "Foreign"
 
--- | A module is identified by its module name and its type.
-data ModuleIdentifier = ModuleIdentifier String ModuleType deriving (Show, Eq, Ord, Generic, Binary)
+type ModuleName = Text
 
-moduleName :: ModuleIdentifier -> String
+-- | A module is identified by its module name and its type.
+data ModuleIdentifier = ModuleIdentifier ModuleName ModuleType deriving (Show, Eq, Ord, Generic, Binary)
+
+moduleName :: ModuleIdentifier -> Text
 moduleName (ModuleIdentifier name _) = name
 
 -- | Given a filename, assuming it is in the correct place on disk, infer a ModuleIdentifier.
 guessModuleIdentifier :: MonadError ErrorMessage m => FilePath -> m ModuleIdentifier
-guessModuleIdentifier filename = ModuleIdentifier (takeFileName (takeDirectory filename)) <$> guessModuleType (takeFileName filename)
+guessModuleIdentifier filename = ModuleIdentifier (T.pack (takeFileName (takeDirectory filename))) <$> guessModuleType (takeFileName filename)
   where
     guessModuleType "index.js" = pure Regular
     guessModuleType "foreign.js" = pure Foreign
@@ -214,7 +217,7 @@ printErrorMessage (ErrorInModule mid e) =
   : map ("  " ++) (printErrorMessage e)
   where
     displayIdentifier (ModuleIdentifier name ty) =
-      name ++ " (" ++ showModuleType ty ++ ")"
+      T.unpack name ++ " (" ++ showModuleType ty ++ ")"
 printErrorMessage (MissingEntryPoint mName) =
   [ "Couldn't find a CommonJS module for the specified entry point: " ++ mName
   ]
@@ -223,12 +226,12 @@ printErrorMessage (MissingMainModule mName) =
   ]
 
 -- | Calculate the ModuleIdentifier which a require(...) statement imports.
-checkImportPath :: String -> ModuleIdentifier -> S.Set String -> Either String ModuleIdentifier
+checkImportPath :: String -> ModuleIdentifier -> S.Set ModuleName -> Either String ModuleIdentifier
 checkImportPath "./foreign.js" m _ =
   Right (ModuleIdentifier (moduleName m) Foreign)
 checkImportPath name _ names
   | Just name' <- stripSuffix "/index.js" =<< stripPrefix "../" name
-  , name' `S.member` names = Right (ModuleIdentifier name' Regular)
+  , T.pack name' `S.member` names = Right (ModuleIdentifier (T.pack name') Regular)
 checkImportPath name _ _ = Left name
 
 stripSuffix :: Eq a => [a] -> [a] -> Maybe [a]
@@ -341,7 +344,7 @@ trailingCommaList (JSCTLNone l) = commaList l
 --
 -- Each type of module element is matched using pattern guards, and everything else is bundled into the
 -- Other constructor.
-toModule :: forall m. (MonadError ErrorMessage m) => S.Set String -> ModuleIdentifier -> Maybe FilePath -> SourceHash -> JSAST -> m (Module Parsed)
+toModule :: forall m. (MonadError ErrorMessage m) => S.Set ModuleName -> ModuleIdentifier -> Maybe FilePath -> SourceHash -> JSAST -> m (Module Parsed)
 toModule mids mid filename sourceHash top
   | JSAstProgram smts _ <- top = Module mid filename sourceHash <$> traverse toModuleElement smts
   | otherwise = err InvalidTopLevel
@@ -380,39 +383,9 @@ toModule mids mid filename sourceHash top
 
   toModuleElement other = pure (Other (CodeParsed other))
 
--- Get a list of all the exported identifiers from a foreign module.
---
--- TODO: what if we assign to exports.foo and then later assign to
--- module.exports (presumably overwriting exports.foo)?
-getExportedIdentifiers :: forall m. (MonadError ErrorMessage m)
-                          => String
-                          -> JSAST
-                          -> m [String]
-getExportedIdentifiers mname top
-  | JSAstProgram stmts _ <- top = concat <$> traverse go stmts
-  | otherwise = err InvalidTopLevel
-  where
-  err :: forall a. ErrorMessage -> m a
-  err = throwError . ErrorInModule (ModuleIdentifier mname Foreign)
-
-  go stmt
-    | Just props <- matchExportsAssignment stmt
-    = traverse toIdent (trailingCommaList props)
-    | Just (True, name, _) <- matchMember stmt
-    = pure [name]
-    | otherwise
-    = pure []
-
-  toIdent (JSPropertyNameandValue name _ [_]) =
-    extractLabel' name
-  toIdent _ =
-    err UnsupportedExport
-
-  extractLabel' = maybe (err UnsupportedExport) pure . extractLabel
-
 -- Matches JS statements like this:
 -- var ModuleName = require("file");
-matchRequire :: S.Set String
+matchRequire :: S.Set ModuleName
                 -> ModuleIdentifier
                 -> JSStatement
                 -> Maybe (String, Either String ModuleIdentifier)
@@ -614,7 +587,7 @@ renderModuleElement = \case
 renderModule :: Module Parsed -> Module Raw
 renderModule mod@Module{module_contents=decls} = mod { module_contents = map renderModuleElement decls }
 
-codeGen2 :: Maybe String -- ^ main module
+codeGen2 :: Maybe ModuleName -- ^ main module
         -> String -- ^ namespace
         -> [Module Raw] -- ^ input modules
         -> Maybe String -- ^ output filename
@@ -677,25 +650,23 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
   require mn =
     JSMemberExpression (JSIdentifier JSNoAnnot "require") JSNoAnnot (cList [ str mn ]) JSNoAnnot
 
-  moduleReference :: JSAnnot -> String -> JSExpression
+  moduleReference :: JSAnnot -> ModuleName -> JSExpression
   moduleReference a mn =
     JSMemberSquare (JSIdentifier a optionsNamespace) JSNoAnnot
-      (str mn) JSNoAnnot
+      (str (T.unpack mn)) JSNoAnnot
 
-  innerModuleReference :: JSAnnot -> String -> JSExpression
+  innerModuleReference :: JSAnnot -> ModuleName -> JSExpression
   innerModuleReference a mn =
     JSMemberSquare (JSIdentifier a "$PS") JSNoAnnot
-      (str mn) JSNoAnnot
-
+      (str (T.unpack mn)) JSNoAnnot
 
   str :: String -> JSExpression
   str s = JSStringLiteral JSNoAnnot $ "\"" ++ s ++ "\""
 
-
   emptyObj :: JSAnnot -> JSExpression
   emptyObj a = JSObjectLiteral a (JSCTLNone JSLNil) JSNoAnnot
 
-  initializeObject :: JSAnnot -> (JSAnnot -> String -> JSExpression) -> String -> JSExpression
+  initializeObject :: JSAnnot -> (JSAnnot -> Text -> JSExpression) -> Text -> JSExpression
   initializeObject a makeReference mn =
     JSAssignExpression (makeReference a mn) (JSAssign sp)
     $ JSExpressionBinary (makeReference sp mn) (JSBinOpOr sp)
@@ -736,7 +707,7 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
       ppStatement' (JSExpressionStatement (initializeObject lfsp innerModuleReference mn) (JSSemi JSNoAnnot)) <>
       ppStatement' (JSVariable lfsp (JSLOne $ JSVarInitExpression (JSIdentifier sp "exports") $ JSVarInit sp (innerModuleReference sp mn)) (JSSemi JSNoAnnot))
 
-  runMain :: String -> JSStatement
+  runMain :: ModuleName -> JSStatement
   runMain mn =
     JSMethodCall
       (JSMemberDot (moduleReference lf mn) JSNoAnnot
@@ -758,7 +729,7 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
 bundleSM :: (MonadError ErrorMessage m, MonadIO m)
        => [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
        -> [ModuleIdentifier] -- ^ Entry points.  These module identifiers are used as the roots for dead-code elimination
-       -> Maybe String -- ^ An optional main module.
+       -> Maybe ModuleName -- ^ An optional main module.
        -> String -- ^ The namespace (e.g. PS).
        -> Maybe FilePath -- ^ The output file name (if there is one - in which case generate source map)
        -> m ByteString
@@ -784,7 +755,7 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
     liftIO $ evaluate $ BL.length code
     pure code
 
-loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set String -> (ModuleIdentifier, FilePath) -> m (Module Raw)
+loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set ModuleName -> (ModuleIdentifier, FilePath) -> m (Module Raw)
 loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
   exists <- liftIO $ doesFileExist cacheFilename
   js <- liftIO $ T.readFile filename
@@ -799,11 +770,11 @@ loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
     parseModuleAndWriteCache js sourceHash
 
   where
-  cacheFilename = ".purs-fast-bundle-cache/" <> modName <> (if moduleType == Regular then "" else "_foreign")
+  cacheFilename = ".purs-fast-bundle-cache/" <> T.unpack modName <> (if moduleType == Regular then "" else "_foreign")
 
   parseModuleAndWriteCache js sourceHash = do
     liftIO $ hPutStrLn stderr $ "Parsing " <> filename
-    ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse (T.unpack js) (moduleName ident)
+    ast <- either (throwError . ErrorInModule ident . UnableToParseModule) pure $ parse (T.unpack js) (T.unpack (moduleName ident))
     module_ <- toModule mids ident (Just filename) sourceHash ast
     let rawModule = renderModule $ withDeps module_
     liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
@@ -831,7 +802,7 @@ main = do
 
   case result of
     Left err -> do
-      print err
+      hPutStrLn stderr $ unlines $ printErrorMessage err
       exitFailure
     Right output ->
       BL.putStr output
