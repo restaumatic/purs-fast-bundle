@@ -601,7 +601,7 @@ codeGen :: Maybe ModuleName -- ^ main module
 codeGen optionsMainModule optionsNamespace ms =
   ppStatement' prelude
   <> mconcat modulesJS
-  <> maybe mempty (ppStatement' . runMain) optionsMainModule -- TODO
+  <> maybe mempty (ppStatement' . runMain) optionsMainModule
   
   where
 
