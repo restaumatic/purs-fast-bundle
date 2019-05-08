@@ -73,6 +73,8 @@ import Language.JavaScript.Parser.AST
 
 import qualified Language.JavaScript.Parser as JS
 
+import qualified Control.Concurrent.ParallelIO.Local as PIO
+
 import System.FilePath (takeFileName, takeDirectory, takeDirectory, makeRelative)
 
 import qualified Data.Text as T
@@ -92,6 +94,8 @@ import Data.Binary (Binary)
 import qualified Data.Binary as Binary
 
 import Crypto.Hash as H
+
+import Control.Concurrent (getNumCapabilities)
 
 type SourceHash = Text
 
@@ -723,16 +727,18 @@ codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
   sp :: JSAnnot
   sp = JSAnnot tokenPosnEmpty [ WhiteSpace tokenPosnEmpty " " ]
 
+type EIO = ExceptT ErrorMessage IO
+
 -- | The bundling function.
 -- This function performs dead code elimination, filters empty modules
 -- and generates and prints the final JavaScript bundle.
-bundleSM :: (MonadError ErrorMessage m, MonadIO m)
-       => [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
+bundleSM
+       :: [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
        -> [ModuleIdentifier] -- ^ Entry points.  These module identifiers are used as the roots for dead-code elimination
        -> Maybe ModuleName -- ^ An optional main module.
        -> String -- ^ The namespace (e.g. PS).
        -> Maybe FilePath -- ^ The output file name (if there is one - in which case generate source map)
-       -> m ByteString
+       -> EIO ByteString
 bundleSM inputFiles entryPoints mainModule namespace outFilename = do
   let mid (a,_,_) = a
 
@@ -744,7 +750,7 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
   -}
 
   let mids = S.fromList (map (moduleName . fst) inputFiles)
-  modules <- logPerf "load modules" $ traverse (loadModule mids) inputFiles
+  modules <- logPerf "load modules" $ parallelEIO $ loadModule mids <$> inputFiles
 
   let compiled = compile modules entryPoints
   logPerf "compile" $ liftIO $ evaluate $ length compiled
@@ -755,7 +761,14 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
     liftIO $ evaluate $ BL.length code
     pure code
 
-loadModule :: (MonadError ErrorMessage m, MonadIO m) => S.Set ModuleName -> (ModuleIdentifier, FilePath) -> m (Module Raw)
+parallelEIO :: [EIO a] -> EIO [a]
+parallelEIO actions = do
+  n <- liftIO getNumCapabilities
+  results <- liftIO $ PIO.withPool n $ \pool ->
+    PIO.parallel pool (((>>= evaluate) . runExceptT) <$> actions)
+  ExceptT $ pure $ sequence results
+
+loadModule :: S.Set ModuleName -> (ModuleIdentifier, FilePath) -> EIO (Module Raw)
 loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
   exists <- liftIO $ doesFileExist cacheFilename
   js <- liftIO $ T.readFile filename
