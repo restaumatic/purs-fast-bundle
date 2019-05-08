@@ -11,6 +11,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wunused-top-binds #-}
 
 -- |
@@ -144,14 +145,14 @@ guessModuleIdentifier filename = ModuleIdentifier (T.pack (takeFileName (takeDir
 
 -- | A piece of code is identified by its module and its name. These keys are used to label vertices
 -- in the dependency graph.
-type Key = (ModuleIdentifier, String)
+type Key = (ModuleIdentifier, Text)
 
 -- | An export is either a "regular export", which exports a name from the regular module we are in,
 -- or a reexport of a declaration in the corresponding foreign module.
 --
 -- Regular exports are labelled, since they might re-export an operator with another name.
 data ExportType
-  = RegularExport String
+  = RegularExport Text
   | ForeignReexport
   deriving (Show, Eq, Ord, Generic, Store)
 
@@ -183,9 +184,9 @@ unwrapParsed (CodeParsed x) = x
 -- Each is labelled with the original AST node which generated it, so that we can dump it back
 -- into the output during codegen.
 data ModuleElement p
-  = Require (Code p JSStatement) String (Either String ModuleIdentifier)
-  | Member (Code p JSStatement) Bool String (Code p JSExpression) [Key]
-  | ExportsList [(ExportType, String, Code p JSExpression, [Key])]
+  = Require (Code p JSStatement) Text (Either Text ModuleIdentifier)
+  | Member (Code p JSStatement) Bool Text (Code p JSExpression) [Key]
+  | ExportsList [(ExportType, Text, Code p JSExpression, [Key])]
   | Other (Code p JSStatement)
   | Skip
   deriving (Show, Generic)
@@ -232,12 +233,12 @@ printErrorMessage (MissingMainModule mName) =
   ]
 
 -- | Calculate the ModuleIdentifier which a require(...) statement imports.
-checkImportPath :: String -> ModuleIdentifier -> S.Set ModuleName -> Either String ModuleIdentifier
+checkImportPath :: Text -> ModuleIdentifier -> S.Set ModuleName -> Either Text ModuleIdentifier
 checkImportPath "./foreign.js" m _ =
   Right (ModuleIdentifier (moduleName m) Foreign)
 checkImportPath name _ names
-  | Just name' <- stripSuffix "/index.js" =<< stripPrefix "../" name
-  , T.pack name' `S.member` names = Right (ModuleIdentifier (T.pack name') Regular)
+  | Just name' <- T.stripSuffix "/index.js" =<< T.stripPrefix "../" name
+  , name' `S.member` names = Right (ModuleIdentifier name' Regular)
 checkImportPath name _ _ = Left name
 
 stripSuffix :: Eq a => [a] -> [a] -> Maybe [a]
@@ -264,18 +265,18 @@ withDeps :: Module Parsed -> Module Parsed
 withDeps mod@Module{module_id=modulePath, module_contents=es} = mod { module_contents = map expandDeps es }
   where
   -- | Collects all modules which are imported, so that we can identify dependencies of the first type.
-  imports :: [(String, ModuleIdentifier)]
+  imports :: [(Text, ModuleIdentifier)]
   imports = mapMaybe toImport es
     where
-    toImport :: ModuleElement Parsed -> Maybe (String, ModuleIdentifier)
+    toImport :: ModuleElement Parsed -> Maybe (Text, ModuleIdentifier)
     toImport (Require _ nm (Right mid)) = Just (nm, mid)
     toImport _ = Nothing
 
   -- | Collects all member names in scope, so that we can identify dependencies of the second type.
-  boundNames :: [String]
+  boundNames :: [Text]
   boundNames = mapMaybe toBoundName es
     where
-    toBoundName :: ModuleElement Parsed -> Maybe String
+    toBoundName :: ModuleElement Parsed -> Maybe Text
     toBoundName (Member _ _ nm _ _) = Just nm
     toBoundName _ = Nothing
 
@@ -287,28 +288,28 @@ withDeps mod@Module{module_id=modulePath, module_contents=es} = mod { module_con
       expand (ty, nm, n1, _) = (ty, nm, n1, S.toList (dependencies modulePath $ unwrapParsed n1))
   expandDeps other = other
 
-  dependencies :: ModuleIdentifier -> JSExpression -> S.Set (ModuleIdentifier, String)
+  dependencies :: ModuleIdentifier -> JSExpression -> S.Set (ModuleIdentifier, Text)
   dependencies m = everything (<>) (mkQ mempty toReference)
     where
-    toReference :: JSExpression -> S.Set (ModuleIdentifier, String)
+    toReference :: JSExpression -> S.Set (ModuleIdentifier, Text)
     toReference (JSMemberDot mn _ nm)
-      | JSIdentifier _ mn' <- mn
-      , JSIdentifier _ nm' <- nm
+      | JSIdentifier _ (T.pack -> mn') <- mn
+      , JSIdentifier _ (T.pack -> nm') <- nm
       , Just mid <- lookup mn' imports
       = S.singleton (mid, nm')
     toReference (JSMemberSquare mn _ nm _)
-      | JSIdentifier _ mn' <- mn
+      | JSIdentifier _ (T.pack -> mn') <- mn
       , Just nm' <- fromStringLiteral nm
       , Just mid <- lookup mn' imports
       = S.singleton (mid, nm')
-    toReference (JSIdentifier _ nm)
+    toReference (JSIdentifier _ (T.pack -> nm))
       | nm `elem` boundNames
       = S.singleton (m, nm)
     toReference _ = mempty
 
 -- String literals include the quote chars
-fromStringLiteral :: JSExpression -> Maybe String
-fromStringLiteral (JSStringLiteral _ str) = Just $ strValue str
+fromStringLiteral :: JSExpression -> Maybe Text
+fromStringLiteral (JSStringLiteral _ str) = Just $ T.pack $ strValue str
 fromStringLiteral _ = Nothing
 
 strValue :: String -> String
@@ -369,7 +370,7 @@ toModule mids mid filename sourceHash top
     | Just props <- matchExportsAssignment stmt
     = ExportsList <$> traverse toExport (trailingCommaList props)
     where
-      toExport :: JSObjectProperty -> m (ExportType, String, Code Parsed JSExpression, [Key])
+      toExport :: JSObjectProperty -> m (ExportType, Text, Code Parsed JSExpression, [Key])
       toExport (JSPropertyNameandValue name _ [val]) =
         (,,CodeParsed val,[]) <$> exportType val
                    <*> extractLabel' name
@@ -382,7 +383,7 @@ toModule mids mid filename sourceHash top
       exportType (JSMemberSquare f _ _ _)
         | JSIdentifier _ "$foreign" <- f
         = pure ForeignReexport
-      exportType (JSIdentifier _ s) = pure (RegularExport s)
+      exportType (JSIdentifier _ s) = pure (RegularExport (T.pack s))
       exportType _ = err UnsupportedExport
 
       extractLabel' = maybe (err UnsupportedExport) pure . extractLabel
@@ -394,7 +395,7 @@ toModule mids mid filename sourceHash top
 matchRequire :: S.Set ModuleName
                 -> ModuleIdentifier
                 -> JSStatement
-                -> Maybe (String, Either String ModuleIdentifier)
+                -> Maybe (Text, Either Text ModuleIdentifier)
 matchRequire mids mid stmt
   | JSVariable _ jsInit _ <- stmt
   , [JSVarInitExpression var varInit] <- commaList jsInit
@@ -404,19 +405,19 @@ matchRequire mids mid stmt
   , JSIdentifier _ "require" <- req
   , [ Just importPath ] <- map fromStringLiteral (commaList argsE)
   , importPath' <- checkImportPath importPath mid mids
-  = Just (importName, importPath')
+  = Just (T.pack importName, importPath')
   | otherwise
   = Nothing
 
 -- Matches JS member declarations.
-matchMember :: JSStatement -> Maybe (Bool, String, JSExpression)
+matchMember :: JSStatement -> Maybe (Bool, Text, JSExpression)
 matchMember stmt
   -- var foo = expr;
   | JSVariable _ jsInit _ <- stmt
   , [JSVarInitExpression var varInit] <- commaList jsInit
   , JSIdentifier _ name <- var
   , JSVarInit _ decl <- varInit
-  = Just (False, name, decl)
+  = Just (False, T.pack name, decl)
   -- exports.foo = expr; exports["foo"] = expr;
   | JSAssignStatement e (JSAssign _) decl _ <- stmt
   , Just name <- accessor e
@@ -424,11 +425,11 @@ matchMember stmt
   | otherwise
   = Nothing
   where
-  accessor :: JSExpression -> Maybe String
+  accessor :: JSExpression -> Maybe Text
   accessor (JSMemberDot exports _ nm)
     | JSIdentifier _ "exports" <- exports
     , JSIdentifier _ name <- nm
-    = Just name
+    = Just (T.pack name)
   accessor (JSMemberSquare exports _ nm _)
     | JSIdentifier _ "exports" <- exports
     , Just name <- fromStringLiteral nm
@@ -448,9 +449,9 @@ matchExportsAssignment stmt
   | otherwise
   = Nothing
 
-extractLabel :: JSPropertyName -> Maybe String
-extractLabel (JSPropertyString _ nm) = Just $ strValue nm
-extractLabel (JSPropertyIdent _ nm) = Just nm
+extractLabel :: JSPropertyName -> Maybe Text
+extractLabel (JSPropertyString _ nm) = Just $ T.pack $ strValue nm
+extractLabel (JSPropertyIdent _ nm) = Just $ T.pack nm
 extractLabel _ = Nothing
 
 -- | Eliminate unused code based on the specified entry point set.
@@ -619,14 +620,14 @@ codeGen optionsMainModule optionsNamespace ms =
       ppStatement' $
         JSVariable lfsp
           (cList [
-            JSVarInitExpression (JSIdentifier sp nm)
+            JSVarInitExpression (JSIdentifier sp (T.unpack nm))
               (JSVarInit sp $ either require (innerModuleReference sp . moduleName) req )
           ]) (JSSemi JSNoAnnot)
     declToJS (ExportsList exps) = foldMap toExport exps
 
       where
 
-      toExport :: (ExportType, String, Code Raw JSExpression, [Key]) -> ByteString
+      toExport :: (ExportType, Text, Code Raw JSExpression, [Key]) -> ByteString
       toExport (_, nm, CodeRaw val, _) =
         ppExpression' (JSMemberSquare (JSIdentifier lfsp "exports") JSNoAnnot (str nm) JSNoAnnot) <>
         " = " <>
@@ -651,22 +652,22 @@ codeGen optionsMainModule optionsNamespace ms =
                   (JSVarInit sp (emptyObj sp))
               ]) (JSSemi JSNoAnnot)
 
-  require :: String -> JSExpression
+  require :: Text -> JSExpression
   require mn =
     JSMemberExpression (JSIdentifier JSNoAnnot "require") JSNoAnnot (cList [ str mn ]) JSNoAnnot
 
   moduleReference :: JSAnnot -> ModuleName -> JSExpression
   moduleReference a mn =
     JSMemberSquare (JSIdentifier a optionsNamespace) JSNoAnnot
-      (str (T.unpack mn)) JSNoAnnot
+      (str mn) JSNoAnnot
 
   innerModuleReference :: JSAnnot -> ModuleName -> JSExpression
   innerModuleReference a mn =
     JSMemberSquare (JSIdentifier a "$PS") JSNoAnnot
-      (str (T.unpack mn)) JSNoAnnot
+      (str mn) JSNoAnnot
 
-  str :: String -> JSExpression
-  str s = JSStringLiteral JSNoAnnot $ "\"" ++ s ++ "\""
+  str :: Text -> JSExpression
+  str s = JSStringLiteral JSNoAnnot $ "\"" ++ T.unpack s ++ "\""
 
   emptyObj :: JSAnnot -> JSExpression
   emptyObj a = JSObjectLiteral a (JSCTLNone JSLNil) JSNoAnnot
@@ -680,14 +681,6 @@ codeGen optionsMainModule optionsNamespace ms =
   -- Like `somewhere`, but stops after the first successful transformation
   firstwhere :: MonadPlus m => GenericM m -> GenericM m
   firstwhere f x = f x `mplus` gmapMo (firstwhere f) x
-
-  prependWhitespace :: String -> [JSStatement] -> [JSStatement]
-  prependWhitespace val = fromMaybe <*> firstwhere (mkMp $ Just . reannotate)
-    where
-    reannotate (JSAnnot rpos annots) = JSAnnot rpos (ws : annots)
-    reannotate _ = JSAnnot tokenPosnEmpty [ws]
-
-    ws = WhiteSpace tokenPosnEmpty val
 
   iife
     :: ByteString -- ^ contents
