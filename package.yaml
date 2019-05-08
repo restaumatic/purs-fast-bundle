@@ -24,7 +24,7 @@ dependencies:
   - text
   - deepseq
   - bytestring
-  - binary
+  - store
   - cryptonite
   - parallel-io
   - optparse-applicative

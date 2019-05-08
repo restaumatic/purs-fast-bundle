@@ -72,6 +72,7 @@ import Language.JavaScript.Parser
 import Language.JavaScript.Parser.AST
 
 import qualified Language.JavaScript.Parser as JS
+import Data.Functor.Contravariant
 
 import qualified Control.Concurrent.ParallelIO.Local as PIO
 
@@ -90,8 +91,8 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as Builder
 
-import Data.Binary (Binary)
-import qualified Data.Binary as Binary
+import Data.Store (Store)
+import qualified Data.Store as Store
 
 import Crypto.Hash as H
 
@@ -119,7 +120,7 @@ data ErrorMessage
 data ModuleType
   = Regular
   | Foreign
-  deriving (Show, Eq, Ord, Generic, Binary)
+  deriving (Show, Eq, Ord, Generic, Store)
 
 showModuleType :: ModuleType -> String
 showModuleType Regular = "Regular"
@@ -128,7 +129,7 @@ showModuleType Foreign = "Foreign"
 type ModuleName = Text
 
 -- | A module is identified by its module name and its type.
-data ModuleIdentifier = ModuleIdentifier ModuleName ModuleType deriving (Show, Eq, Ord, Generic, Binary)
+data ModuleIdentifier = ModuleIdentifier ModuleName ModuleType deriving (Show, Eq, Ord, Generic, Store)
 
 moduleName :: ModuleIdentifier -> Text
 moduleName (ModuleIdentifier name _) = name
@@ -152,7 +153,7 @@ type Key = (ModuleIdentifier, String)
 data ExportType
   = RegularExport String
   | ForeignReexport
-  deriving (Show, Eq, Ord, Generic, Binary)
+  deriving (Show, Eq, Ord, Generic, Store)
 
 data Phase = Raw | Parsed
 
@@ -164,9 +165,10 @@ instance Show a => Show (Code phase a) where
   show (CodeRaw x) = show x
   show (CodeParsed x) = show x
 
-instance Binary (Code Raw a) where
-  put (CodeRaw x) = Binary.put x
-  get = CodeRaw <$> Binary.get
+instance Store (Code Raw a) where
+  size = contramap (\(CodeRaw x) -> x) Store.size
+  peek = CodeRaw <$> Store.peek
+  poke (CodeRaw x) = Store.poke x
 
 unwrapParsed :: Code Parsed a -> a
 unwrapParsed (CodeParsed x) = x
@@ -188,13 +190,13 @@ data ModuleElement p
   | Skip
   deriving (Show, Generic)
 
-deriving instance Binary (ModuleElement Raw)
+deriving instance Store (ModuleElement Raw)
 
 -- | A module is just a list of elements of the types listed above.
 data Module p = Module { module_id :: ModuleIdentifier , module_filename :: Maybe FilePath, module_sourceHash :: SourceHash, module_contents :: [ModuleElement p] }
   deriving (Show, Generic)
 
-deriving instance Binary (Module Raw)
+deriving instance Store (Module Raw)
 
 -- | Prepare an error message for consumption by humans.
 printErrorMessage :: ErrorMessage -> [String]
@@ -771,7 +773,7 @@ loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
   js <- liftIO $ T.readFile filename
   let sourceHash = hexSha1 js
   if exists then
-    liftIO (Binary.decodeFileOrFail cacheFilename) >>= \case
+    liftIO (Store.decode <$> BS.readFile cacheFilename) >>= \case
       Right mod | module_sourceHash mod == sourceHash ->
         pure mod
       _ ->
@@ -788,7 +790,7 @@ loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
     module_ <- toModule mids ident (Just filename) sourceHash ast
     let rawModule = renderModule $ withDeps module_
     liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
-    liftIO $ Binary.encodeFile cacheFilename rawModule
+    liftIO $ BS.writeFile cacheFilename $ Store.encode rawModule
     pure rawModule
 
 logPerf :: MonadIO m => Text -> m t -> m t
