@@ -38,7 +38,7 @@
 --
 -- THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -- ```
-module Bundle (main) where
+module Bundle where
 
 import Prelude.Compat
 import Protolude (ordNub, for, exitFailure, encodeUtf8)
@@ -591,12 +591,11 @@ renderModuleElement = \case
 renderModule :: Module Parsed -> Module Raw
 renderModule mod@Module{module_contents=decls} = mod { module_contents = map renderModuleElement decls }
 
-codeGen2 :: Maybe ModuleName -- ^ main module
+codeGen :: Maybe ModuleName -- ^ main module
         -> String -- ^ namespace
         -> [Module Raw] -- ^ input modules
-        -> Maybe String -- ^ output filename
         -> ByteString
-codeGen2 optionsMainModule optionsNamespace ms outFileOpt =
+codeGen optionsMainModule optionsNamespace ms =
   ppStatement' prelude
   <> mconcat modulesJS
   <> maybe mempty (ppStatement' . runMain) optionsMainModule -- TODO
@@ -732,14 +731,12 @@ type EIO = ExceptT ErrorMessage IO
 -- | The bundling function.
 -- This function performs dead code elimination, filters empty modules
 -- and generates and prints the final JavaScript bundle.
-bundleSM
-       :: [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
+bundle :: [(ModuleIdentifier, FilePath)] -- ^ The input modules.  Each module should be javascript rendered from the compiler.
        -> [ModuleIdentifier] -- ^ Entry points.  These module identifiers are used as the roots for dead-code elimination
        -> Maybe ModuleName -- ^ An optional main module.
        -> String -- ^ The namespace (e.g. PS).
-       -> Maybe FilePath -- ^ The output file name (if there is one - in which case generate source map)
        -> EIO ByteString
-bundleSM inputFiles entryPoints mainModule namespace outFilename = do
+bundle inputFiles entryPoints mainModule namespace = do
   let mid (a,_,_) = a
 
   {- TODO: validations
@@ -757,7 +754,7 @@ bundleSM inputFiles entryPoints mainModule namespace outFilename = do
   sorted <- logPerf "sortModules" $ liftIO $ evaluate $ sortModules (filter (not . isModuleEmpty) compiled)
 
   logPerf "codegen" $ do
-    let code = codeGen2 mainModule namespace sorted outFilename
+    let code = codeGen mainModule namespace sorted
     liftIO $ evaluate $ BL.length code
     pure code
 
@@ -793,32 +790,6 @@ loadModule mids (ident@(ModuleIdentifier modName moduleType), filename) = do
     liftIO $ createDirectoryIfMissing True $ takeDirectory cacheFilename
     liftIO $ Binary.encodeFile cacheFilename rawModule
     pure rawModule
-
-main :: IO ()
-main = do
-  let optionsEntryPoints = ["Main"]
-  let optionsMainModule = Just "Main"
-  let optionsNamespace = "PS"
-
-  inputFiles <- getArgs
-
-  result <- runExceptT $ do
-    
-    input <- for inputFiles $ \filename -> do
-      mid <- guessModuleIdentifier filename
-      return (mid, filename)
-
-    let entryIds = map (`ModuleIdentifier` Regular) optionsEntryPoints
-
-    currentDir <- liftIO getCurrentDirectory
-    bundleSM input entryIds optionsMainModule optionsNamespace Nothing
-
-  case result of
-    Left err -> do
-      hPutStrLn stderr $ unlines $ printErrorMessage err
-      exitFailure
-    Right output ->
-      BL.putStr output
 
 logPerf :: MonadIO m => Text -> m t -> m t
 logPerf label f = do

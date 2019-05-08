@@ -27,6 +27,8 @@ dependencies:
   - binary
   - cryptonite
   - parallel-io
+  - optparse-applicative
+  - Glob
 
 executables:
   purs-fast-bundle:
